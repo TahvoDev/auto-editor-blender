@@ -1,0 +1,22 @@
+{
+  "version": "3",
+  "templateFile": "source.mp4",
+  "timebase": "30000/1001",
+  "background": "#000000",
+  "resolution": [1280, 720],
+  "samplerate": 48000,
+  "layout": "stereo",
+  "langs": ["eng", "eng"],
+  "v": [
+    [
+      {"src": "source.mp4", "start": 0, "dur": 30, "offset": 0, "stream": 0},
+      {"src": "source.mp4", "start": 30, "dur": 60, "offset": 90, "stream": 0, "effects": ["speed:2"]},
+      {"src": "source.mp4", "start": 90, "dur": 10, "offset": 200, "stream": 0, "effects": ["cut"]}
+    ]
+  ],
+  "a": [
+    [
+      {"src": "source.mp4", "start": 0, "dur": 30, "offset": 0, "stream": 0}
+    ]
+  ]
+}
