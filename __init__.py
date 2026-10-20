@@ -10,7 +10,7 @@ ADDON_ID = __package__
 bl_info = {
     "name": "Auto-Editor Blender",
     "author": "Jenny",
-    "version": (0, 1, 0),
+    "version": (0, 1, 1),
     "blender": (4, 2, 0),
     "location": "Sequencer > Sidebar > Auto-Editor",
     "description": "Remove silence gaps from VSE strips without touching source files",
@@ -118,6 +118,8 @@ class AUTO_EDITOR_PT_main(bpy.types.Panel):
             for strip in vse.selected_strips(context)
             if strip.type in {"MOVIE", "SOUND"}
         ]
+        movies = [strip for strip in selected if strip.type == "MOVIE"]
+        sounds = [strip for strip in selected if strip.type == "SOUND"]
 
         box = layout.box()
         if exe:
@@ -131,10 +133,18 @@ class AUTO_EDITOR_PT_main(bpy.types.Panel):
                 icon="PREFERENCES",
             ).module = ADDON_ID
 
-        layout.label(text=f"Selected: {len(selected)} strip(s)")
+        layout.label(text=f"Selected: {len(movies)} movie, {len(sounds)} sound")
         if not selected:
             layout.label(text="Select movie strip(s) in the VSE", icon="INFO")
+        elif movies and sounds:
+            layout.label(text="Select movie or sound strips, not both", icon="ERROR")
 
+        row = layout.row()
+        row.scale_y = 1.5
+        row.enabled = bool(exe and selected and not (movies and sounds))
+        row.operator("auto_editor.remove_gaps", text="Remove Gaps", icon="SEQUENCE")
+
+        layout.separator()
         settings = context.scene.auto_editor_settings
         layout.prop(settings, "preset")
         if settings.preset == "SILENCE":
@@ -146,13 +156,28 @@ class AUTO_EDITOR_PT_main(bpy.types.Panel):
         layout.prop(settings, "ripple")
         layout.prop(settings, "keep_original")
 
-        row = layout.row()
-        row.scale_y = 1.4
-        row.enabled = bool(exe and selected)
-        row.operator("auto_editor.remove_gaps", text="Remove Gaps", icon="SEQUENCER")
+
+class AUTO_EDITOR_PT_advanced(bpy.types.Panel):
+    bl_label = "Advanced"
+    bl_parent_id = "AUTO_EDITOR_PT_main"
+    bl_space_type = "SEQUENCE_EDITOR"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.auto_editor_settings
+        layout.prop(settings, "extra_args")
 
         box = layout.box()
         box.label(text="Command preview", icon="CONSOLE")
+        prefs = ops._prefs(context)
+        exe = ops.find_executable(prefs)
+        selected = [
+            strip
+            for strip in vse.selected_strips(context)
+            if strip.type in {"MOVIE", "SOUND"}
+        ]
         if exe and selected:
             try:
                 source = vse.source_path(selected[0])
@@ -170,13 +195,12 @@ class AUTO_EDITOR_PT_main(bpy.types.Panel):
         else:
             box.label(text="-")
 
-        layout.prop(settings, "extra_args")
-
 
 classes = (
     AutoEditorPreferences,
     AutoEditorSettings,
     AUTO_EDITOR_PT_main,
+    AUTO_EDITOR_PT_advanced,
 ) + ops.classes
 
 
@@ -188,10 +212,16 @@ def register():
     )
     try:
         prefs = ops._prefs(bpy.context)
-        if prefs is not None and not prefs.exe_path:
+        if prefs is not None:
             path = ops.find_executable(prefs)
             if path:
-                prefs.exe_path = path
+                if not prefs.exe_path:
+                    prefs.exe_path = path
+                if not prefs.version:
+                    try:
+                        prefs.version = ops.run_version(path)
+                    except Exception:
+                        pass
     except Exception:
         pass
 

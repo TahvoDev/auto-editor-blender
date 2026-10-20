@@ -45,6 +45,10 @@ a Blender extension/add-on directory.
 3. Pick **Cut silence** or **Cut motionless**, adjust the threshold if needed.
 4. Click **Remove Gaps**.
 
+Select either movie strips or sound strips for one run, not both. Movie strips
+already carry their audio; selecting both would duplicate the audio. The
+**Advanced** subpanel has extra CLI arguments and a command preview.
+
 If several selected strips are on the same channel and **Ripple selected strips**
 is enabled, their kept clips are placed back to back as one continuous sequence.
 Otherwise each strip is processed in place.
@@ -60,6 +64,7 @@ keep them on their channels, muted.
 - The add-on matches the scene FPS to the source FPS by default. If two selected
   sources have different frame rates, process them separately.
 - Movie strips that already have a Speed Control effect are not supported.
+- Separate sound strips are processed only when selected without movie strips.
 
 ## Development
 

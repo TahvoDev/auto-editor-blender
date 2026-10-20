@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "auto_editor_blender"
-version = "0.1.0"
+version = "0.1.1"
 name = "Auto-Editor Blender"
 tagline = "Remove silence gaps from VSE strips, non-destructively"
 maintainer = "Jenny"

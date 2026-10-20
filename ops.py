@@ -357,6 +357,16 @@ class AUTO_EDITOR_OT_remove_gaps(bpy.types.Operator):
             self.report({"ERROR"}, "Select one or more movie strips in the VSE.")
             return {"CANCELLED"}
 
+        movies = [strip for strip in selected if strip.type == "MOVIE"]
+        sounds = [strip for strip in selected if strip.type == "SOUND"]
+        if movies and sounds:
+            self.report(
+                {"ERROR"},
+                "Select either movie strips or sound strips, not both. "
+                "Movie strips already include their audio.",
+            )
+            return {"CANCELLED"}
+
         settings = context.scene.auto_editor_settings
         options = RunOptions(
             preset=settings.preset,
