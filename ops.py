@@ -11,6 +11,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import bpy
 
@@ -384,6 +385,130 @@ class AUTO_EDITOR_OT_test_binary(bpy.types.Operator):
         return {"FINISHED"}
 
 
+@dataclass
+class ActiveJob:
+    worker: AnalyzeWorker
+    queue: queue.Queue
+    tempdir: str
+    settings: object
+    scene: object
+    total_runs: int
+    label: str = ""
+    percent: int = -1
+
+
+_ACTIVE: ActiveJob | None = None
+
+
+def _tag_redraw():
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _write_log(text):
+    try:
+        log = bpy.data.texts.get("Auto-Editor Log")
+        if log is None:
+            log = bpy.data.texts.new("Auto-Editor Log")
+        log.clear()
+        log.write(text or "")
+    except Exception:
+        pass
+
+
+def _set_status(job, text):
+    try:
+        job.scene.auto_editor_settings.status = text
+    except Exception:
+        pass
+    _tag_redraw()
+
+
+def _finish_job(job, summary="", error="", cancelled=False):
+    global _ACTIVE
+    try:
+        settings = job.scene.auto_editor_settings
+        settings.running = False
+        settings.error = error
+        settings.status = "Cancelled" if cancelled else (error or summary)
+    except Exception:
+        pass
+    shutil.rmtree(job.tempdir, ignore_errors=True)
+    _ACTIVE = None
+    _tag_redraw()
+
+
+def _poll():
+    job = _ACTIVE
+    if job is None:
+        return None
+    try:
+        while True:
+            message = job.queue.get_nowait()
+            kind = message[0]
+            if kind == "progress":
+                _, index, fraction = message
+                percent = int(
+                    min(100.0, max(0.0, ((index + fraction) / job.total_runs) * 100.0))
+                )
+                if percent != job.percent:
+                    job.percent = percent
+                    _set_status(job, f"{job.label or 'Working'} — {percent}%")
+            elif kind == "status":
+                job.label = message[1]
+                job.percent = -1
+                _set_status(job, f"{job.label}…")
+            elif kind == "error":
+                _write_log(message[2])
+                _finish_job(job, error=message[1])
+                return None
+            elif kind == "cancelled":
+                _finish_job(job, cancelled=True)
+                return None
+            elif kind == "done":
+                try:
+                    summary = vse.build_cuts(
+                        SimpleNamespace(scene=job.scene), message[1], job.settings
+                    )
+                except Exception as exc:
+                    _write_log("")
+                    _finish_job(job, error=str(exc))
+                else:
+                    _finish_job(job, summary=summary)
+                return None
+    except queue.Empty:
+        pass
+    return 0.1
+
+
+def stop():
+    global _ACTIVE
+    job = _ACTIVE
+    if job is None:
+        return
+    job.worker.cancel()
+    try:
+        job.worker.join(timeout=2)
+    except Exception:
+        pass
+    shutil.rmtree(job.tempdir, ignore_errors=True)
+    try:
+        job.scene.auto_editor_settings.running = False
+        job.scene.auto_editor_settings.status = "Cancelled"
+    except Exception:
+        pass
+    _ACTIVE = None
+    try:
+        if bpy.app.timers.is_registered(_poll):
+            bpy.app.timers.unregister(_poll)
+    except Exception:
+        pass
+
+
 class AUTO_EDITOR_OT_remove_gaps(bpy.types.Operator):
     bl_idname = "auto_editor.remove_gaps"
     bl_label = "Remove Gaps"
@@ -395,15 +520,25 @@ class AUTO_EDITOR_OT_remove_gaps(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        settings = context.scene.auto_editor_settings
         has_strips = any(
             strip.type in {"MOVIE", "SOUND"} for strip in vse.selected_strips(context)
         )
-        return has_strips and find_executable(_prefs(context)) is not None
+        return (
+            not settings.running
+            and has_strips
+            and find_executable(_prefs(context)) is not None
+        )
 
     def invoke(self, context, event):
         return self.execute(context)
 
     def execute(self, context):
+        global _ACTIVE
+        if _ACTIVE is not None:
+            self.report({"ERROR"}, "An Auto-Editor job is already running.")
+            return {"CANCELLED"}
+
         prefs = _prefs(context)
         exe = find_executable(prefs)
         if not exe:
@@ -434,107 +569,64 @@ class AUTO_EDITOR_OT_remove_gaps(bpy.types.Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
-        self._tempdir = tempfile.mkdtemp(prefix="auto_editor_")
-        self._queue = queue.Queue()
-        self._worker = AnalyzeWorker(jobs, options, exe, self._tempdir, self._queue)
-        self._settings = settings
-        self._job_count = self._worker.total_runs
-        self._cleaned = False
-        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
-        context.window_manager.modal_handler_add(self)
-        context.window_manager.progress_begin(0, 100)
-        self._worker.start()
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        if event.type == "ESC":
-            return self.cancel(context)
-
-        if event.type != "TIMER":
-            return {"RUNNING_MODAL"}
-
+        messages = queue.Queue()
+        worker = AnalyzeWorker(
+            jobs,
+            options,
+            exe,
+            tempfile.mkdtemp(prefix="auto_editor_"),
+            messages,
+        )
+        job = ActiveJob(
+            worker=worker,
+            queue=messages,
+            tempdir=worker.tempdir,
+            settings=SimpleNamespace(
+                match_fps=settings.match_fps,
+                ripple=settings.ripple,
+                keep_original=settings.keep_original,
+            ),
+            scene=context.scene,
+            total_runs=worker.total_runs,
+            label=jobs[0].name,
+        )
+        settings.error = ""
+        settings.status = "Starting auto-editor…"
+        settings.running = True
+        _ACTIVE = job
+        worker.start()
         try:
-            while True:
-                message = self._queue.get_nowait()
-                kind = message[0]
-                if kind == "progress":
-                    _, index, fraction = message
-                    percent = ((index + fraction) / self._job_count) * 100.0
-                    context.window_manager.progress_update(min(100.0, max(0.0, percent)))
-                elif kind == "status":
-                    self._status(context, message[1])
-                elif kind == "error":
-                    _, error, log = message
-                    self._write_log(log)
-                    self.report({"ERROR"}, error)
-                    self._cleanup(context)
-                    return {"CANCELLED"}
-                elif kind == "cancelled":
-                    self._cleanup(context)
-                    return {"CANCELLED"}
-                elif kind == "done":
-                    try:
-                        summary = vse.build_cuts(context, message[1], self._settings)
-                    except Exception as exc:
-                        self._write_log("")
-                        self.report({"ERROR"}, str(exc))
-                        self._cleanup(context)
-                        return {"CANCELLED"}
-                    self.report({"INFO"}, summary)
-                    self._cleanup(context)
-                    return {"FINISHED"}
-        except queue.Empty:
-            pass
-        return {"RUNNING_MODAL"}
+            if not bpy.app.timers.is_registered(_poll):
+                bpy.app.timers.register(_poll, first_interval=0.1)
+        except Exception as exc:
+            worker.cancel()
+            _finish_job(job, error=f"Could not start progress timer: {exc}")
+            return {"CANCELLED"}
+        _tag_redraw()
+        return {"FINISHED"}
 
-    def cancel(self, context):
-        if getattr(self, "_worker", None) is not None:
-            self._worker.cancel()
-        self._cleanup(context)
-        return {"CANCELLED"}
 
-    def _status(self, context, text):
-        try:
-            context.workspace.status_text_set(f"Auto-Editor: {text}")
-        except Exception:
-            pass
+class AUTO_EDITOR_OT_cancel(bpy.types.Operator):
+    bl_idname = "auto_editor.cancel"
+    bl_label = "Cancel auto-editor"
+    bl_description = "Stop the running auto-editor analysis"
 
-    def _write_log(self, text):
-        log = bpy.data.texts.get("Auto-Editor Log")
-        if log is None:
-            log = bpy.data.texts.new("Auto-Editor Log")
-        log.clear()
-        log.write(text or "")
+    @classmethod
+    def poll(cls, context):
+        return context.scene.auto_editor_settings.running
 
-    def _cleanup(self, context):
-        if getattr(self, "_cleaned", False):
-            return
-        self._cleaned = True
-        try:
-            context.window_manager.progress_end()
-        except Exception:
-            pass
-        try:
-            context.workspace.status_text_set(None)
-        except Exception:
-            pass
-        if getattr(self, "_timer", None) is not None:
-            try:
-                context.window_manager.event_timer_remove(self._timer)
-            except Exception:
-                pass
-        tempdir = getattr(self, "_tempdir", None)
-        if tempdir:
-            shutil.rmtree(tempdir, ignore_errors=True)
-        try:
-            for area in context.screen.areas:
-                area.tag_redraw()
-        except Exception:
-            pass
+    def execute(self, context):
+        job = _ACTIVE
+        if job is not None:
+            job.worker.cancel()
+        context.scene.auto_editor_settings.status = "Cancelling…"
+        _tag_redraw()
+        return {"FINISHED"}
 
 
 classes = (
     AUTO_EDITOR_OT_detect_binary,
     AUTO_EDITOR_OT_test_binary,
     AUTO_EDITOR_OT_remove_gaps,
+    AUTO_EDITOR_OT_cancel,
 )

@@ -10,7 +10,7 @@ ADDON_ID = __package__
 bl_info = {
     "name": "Auto-Editor Blender",
     "author": "Jenny",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (4, 2, 0),
     "location": "Sequencer > Sidebar > Auto-Editor",
     "description": "Remove silence gaps from VSE strips without touching source files",
@@ -71,6 +71,9 @@ class AutoEditorSettings(bpy.types.PropertyGroup):
         description="Extra arguments appended to the auto-editor command",
         default="",
     )
+    running: bpy.props.BoolProperty(default=False)
+    status: bpy.props.StringProperty(default="")
+    error: bpy.props.StringProperty(default="")
 
 
 class AutoEditorPreferences(bpy.types.AddonPreferences):
@@ -141,11 +144,21 @@ class AUTO_EDITOR_PT_main(bpy.types.Panel):
         elif movies and sounds:
             layout.label(text="Sounds overlapping movies are paired", icon="LINKED")
 
-        row = layout.row()
-        row.scale_y = 1.5
-        row.enabled = bool(exe and selected)
-        action = "Cut Silence" if settings.preset == "SILENCE" else "Cut Motionless"
-        row.operator("auto_editor.remove_gaps", text=action, icon="PLAY")
+        if settings.running:
+            row = layout.row()
+            row.label(text=settings.status or "Working…", icon="TIME")
+            layout.operator("auto_editor.cancel", text="Cancel", icon="CANCEL")
+        else:
+            row = layout.row()
+            row.scale_y = 1.5
+            row.enabled = bool(exe and selected)
+            action = "Cut Silence" if settings.preset == "SILENCE" else "Cut Motionless"
+            row.operator("auto_editor.remove_gaps", text=action, icon="PLAY")
+
+        if settings.error:
+            layout.label(text=settings.error, icon="ERROR")
+        elif settings.status and not settings.running:
+            layout.label(text=settings.status, icon="INFO")
 
         layout.separator()
         layout.prop(settings, "preset")
@@ -213,6 +226,13 @@ def register():
         type=AutoEditorSettings
     )
     try:
+        settings = bpy.context.scene.auto_editor_settings
+        settings.running = False
+        settings.status = ""
+        settings.error = ""
+    except Exception:
+        pass
+    try:
         prefs = ops._prefs(bpy.context)
         if prefs is not None:
             path = ops.find_executable(prefs)
@@ -229,6 +249,7 @@ def register():
 
 
 def unregister():
+    ops.stop()
     if hasattr(bpy.types.Scene, "auto_editor_settings"):
         del bpy.types.Scene.auto_editor_settings
     for cls in reversed(classes):

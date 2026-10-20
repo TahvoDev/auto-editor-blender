@@ -9,8 +9,8 @@ Motionless**), and the add-on:
 1. runs the official [`auto-editor`](https://github.com/WyattBlue/auto-editor) binary
    on each source file,
 2. reads auto-editor's `.v3` timeline,
-3. replaces the selected strips with trimmed movie/sound strips on a new channel,
-   placed back to back,
+3. replaces the selected strips with trimmed movie/sound strips, keeping the
+   original channels where possible and placing them back to back,
 4. leaves the source files untouched.
 
 The edit is a normal Blender undo step. `Ctrl+Z` restores the original strips.
@@ -61,6 +61,12 @@ Otherwise each strip is processed in place.
 The original strips are removed by default. Enable **Keep originals (muted)** to
 keep them on their channels, muted.
 
+Analysis runs in the background: the sidebar shows progress and a **Cancel**
+button, and the editor stays responsive. Rebuilt video strips stay on their
+original channel when it is free over the edited range. Paired sound stays on its
+own channel; embedded movie audio goes to a free channel. With **Keep originals**
+enabled, new strips use free channels so they do not overlap the muted originals.
+
 ## Limits in 0.1
 
 - One video layer and at most one audio layer per source.
@@ -94,7 +100,15 @@ AUTO_EDITOR_TEST_VIDEO=/path/to/video.mp4 \
   blender -b --factory-startup --python tests/blender_pair.py
 ```
 
-Both tests are skipped when `AUTO_EDITOR_TEST_VIDEO` is not set.
+The background test exercises the non-modal operator, progress polling, channel
+preservation, and cleanup:
+
+```bash
+AUTO_EDITOR_TEST_VIDEO=/path/to/video.mp4 \
+  blender -b --factory-startup --python tests/blender_background.py
+```
+
+All three tests are skipped when `AUTO_EDITOR_TEST_VIDEO` is not set.
 
 ## License
 

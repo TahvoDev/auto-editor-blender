@@ -89,6 +89,29 @@ def find_free_channel(sequence_editor) -> int:
     return max((strip.channel for strip in strips), default=0) + 1
 
 
+def _strip_key(strip) -> int:
+    try:
+        return strip.as_pointer()
+    except (AttributeError, ReferenceError):
+        return id(strip)
+
+
+def _channel_conflict(sequence_editor, channel, start, end, ignored_keys) -> bool:
+    for strip in top_strips(sequence_editor):
+        if strip.channel != channel or _strip_key(strip) in ignored_keys:
+            continue
+        strip_start = strip.frame_final_start
+        strip_end = strip_start + strip.frame_final_duration
+        if strip_start < end and strip_end > start:
+            return True
+    return False
+
+
+def _unique_channel(strips):
+    channels = {strip.channel for strip in strips}
+    return next(iter(channels)) if len(channels) == 1 else None
+
+
 def has_speed_control(sequence_editor, strip) -> bool:
     for candidate in top_strips(sequence_editor):
         if getattr(candidate, "type", None) == "SPEED" and getattr(
@@ -333,25 +356,84 @@ def build_cuts(context, jobs, settings) -> str:
         groups = [jobs] if ripple else [[job] for job in jobs]
         groups.sort(key=lambda group: min(strip.channel for strip, _, _ in group))
 
-        next_channel = find_free_channel(sequence_editor)
-        group_channels = []
+        group_originals = []
         for group in groups:
-            has_movie = any(strip.type == "MOVIE" for strip, _, _ in group)
-            has_audio = any(strip.type == "SOUND" for strip, _, _ in group) or any(
+            originals = []
+            for strip, _, audio_strip in group:
+                originals.append(strip)
+                if audio_strip is not None and audio_strip is not strip:
+                    originals.append(audio_strip)
+            group_originals.append(originals)
+        selected_keys = {
+            _strip_key(strip) for originals in group_originals for strip in originals
+        }
+
+        next_channel = find_free_channel(sequence_editor)
+        reserved = set()
+        group_channels = []
+
+        def allocate():
+            nonlocal next_channel
+            while next_channel in reserved:
+                next_channel += 1
+            channel = next_channel
+            next_channel += 1
+            reserved.add(channel)
+            return channel
+
+        for group, originals in zip(groups, group_originals):
+            start = min(strip.frame_final_start for strip in originals)
+            end = max(
+                strip.frame_final_start + strip.frame_final_duration
+                for strip in originals
+            )
+            movie_strips = [strip for strip in originals if strip.type == "MOVIE"]
+            sound_strips = [strip for strip in originals if strip.type == "SOUND"]
+            has_movie = bool(movie_strips)
+            has_audio = bool(sound_strips) or any(
                 audio_strip is not None
                 or bool(v3.kept(v3.single_audio_layer(timeline)))
                 for strip, timeline, audio_strip in group
                 if strip.type == "MOVIE"
             )
-            movie_channel = next_channel if has_movie else None
+
+            movie_channel = None
             if has_movie:
-                next_channel += 1
-            sound_channel = next_channel if has_audio else None
+                original = (
+                    None if settings.keep_original else _unique_channel(movie_strips)
+                )
+                if (
+                    original is not None
+                    and original not in reserved
+                    and not _channel_conflict(
+                        sequence_editor, original, start, end, selected_keys
+                    )
+                ):
+                    movie_channel = original
+                    reserved.add(original)
+                else:
+                    movie_channel = allocate()
+
+            sound_channel = None
             if has_audio:
-                next_channel += 1
+                original = (
+                    None if settings.keep_original else _unique_channel(sound_strips)
+                )
+                if (
+                    original is not None
+                    and original != movie_channel
+                    and original not in reserved
+                    and not _channel_conflict(
+                        sequence_editor, original, start, end, selected_keys
+                    )
+                ):
+                    sound_channel = original
+                    reserved.add(original)
+                else:
+                    sound_channel = allocate()
             group_channels.append((movie_channel, sound_channel))
 
-        if next_channel - 1 > MAX_CHANNEL:
+        if max(reserved, default=0) > MAX_CHANNEL:
             raise BuildError(f"Not enough free VSE channels (max {MAX_CHANNEL})")
 
         plan = []
@@ -366,38 +448,38 @@ def build_cuts(context, jobs, settings) -> str:
             )
             plan.extend(group_plan)
             for strip in group_originals:
-                if id(strip) not in seen_originals:
-                    seen_originals.add(id(strip))
+                key = _strip_key(strip)
+                if key not in seen_originals:
+                    seen_originals.add(key)
                     originals.append(strip)
 
         if not plan:
             raise BuildError("auto-editor kept nothing for the selected strip(s)")
 
-        used_channels = {strip.channel for strip in strip_collection}
-        used_channels.update(item.channel for item in plan)
-        temp_channel = next(
+        staging_base = max(
             (
-                channel
-                for channel in range(1, MAX_CHANNEL + 1)
-                if channel not in used_channels
+                strip.frame_final_start + strip.frame_final_duration
+                for strip in strip_collection
             ),
-            None,
+            default=0,
         )
-        if temp_channel is None:
-            raise BuildError("Not enough free VSE channels to stage the edit")
-
+        staging_base += (
+            max((item.src_offset + item.duration for item in plan), default=0) + 1000
+        )
+        staging_next = {}
         for item in plan:
+            start = staging_next.get(item.channel, staging_base)
             if item.kind == "MOVIE":
                 strip = strip_collection.new_movie(
-                    item.name, item.source, temp_channel, frame_start=0
+                    item.name, item.source, item.channel, frame_start=start
                 )
             else:
                 strip = strip_collection.new_sound(
-                    item.name, item.source, temp_channel, frame_start=0
+                    item.name, item.source, item.channel, frame_start=start
                 )
             created.append(strip)
-            _trim(strip, item.new_start, item.src_offset, item.duration)
-            strip.channel = item.channel
+            _trim(strip, start, item.src_offset, item.duration)
+            staging_next[item.channel] = start + item.duration + 1
 
         if settings.keep_original:
             for strip in originals:
@@ -408,6 +490,9 @@ def build_cuts(context, jobs, settings) -> str:
                     strip_collection.remove(strip)
                 except (ReferenceError, RuntimeError):
                     pass
+
+        for strip, item in zip(created, plan):
+            strip.frame_start = item.new_start - item.src_offset
 
         try:
             bpy.ops.ed.undo_push(message="Auto-Editor: remove gaps")

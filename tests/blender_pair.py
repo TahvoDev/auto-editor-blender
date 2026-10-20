@@ -117,6 +117,8 @@ def main():
     assert len(movies) > 1
     assert len(movies) == len(sounds)
     assert {strip.name for strip in movies} != {"source"}
+    assert {strip.channel for strip in movies} == {1}
+    assert {strip.channel for strip in sounds} == {2}
     assert all(
         Path(bpy.path.abspath(strip.sound.filepath)).resolve() == Path(video)
         for strip in sounds
@@ -137,6 +139,8 @@ def main():
     movies, sounds = split(sequence_editor)
     assert len(movies) > 1
     assert 0 < len(sounds) <= len(movies)
+    assert {strip.channel for strip in movies} == {1}
+    assert {strip.channel for strip in sounds} == {2}
     assert all(
         Path(bpy.path.abspath(strip.sound.filepath)).resolve() == audio_path.resolve()
         for strip in sounds
@@ -155,6 +159,7 @@ def main():
     movies, sounds = split(sequence_editor)
     assert not movies
     assert len(sounds) > 1
+    assert {strip.channel for strip in sounds} == {1}
     print("PASS sound-only", len(sounds), "sound")
     print("PAIR PASS")
 

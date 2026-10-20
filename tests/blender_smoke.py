@@ -41,6 +41,7 @@ def main():
     )
     original_start = source.frame_final_start
     original_name = source.name
+    original_channel = source.channel
 
     exe = ops.find_executable()
     assert exe, "auto-editor not found"
@@ -92,6 +93,7 @@ def main():
     assert len(movies) > 1
     assert len(movies) == len(sounds)
     assert movies[0].frame_final_start == original_start
+    assert {strip.channel for strip in movies} == {original_channel}
     for left, right in zip(movies, movies[1:]):
         assert right.frame_final_start == left.frame_final_start + left.frame_final_duration
     for movie, sound in zip(movies, sounds):
