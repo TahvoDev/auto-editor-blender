@@ -40,6 +40,64 @@ class Job:
     strip: object
     source: str
     name: str
+    audio_strip: object | None = None
+
+
+def _same_source(a, b) -> bool:
+    try:
+        return Path(vse.source_path(a)).resolve() == Path(vse.source_path(b)).resolve()
+    except vse.BuildError:
+        return False
+
+
+def _overlap_ratio(a, b) -> float:
+    a_start = a.frame_final_start
+    a_end = a_start + a.frame_final_duration
+    b_start = b.frame_final_start
+    b_end = b_start + b.frame_final_duration
+    overlap = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+    shorter = min(a.frame_final_duration, b.frame_final_duration)
+    return overlap / shorter if shorter > 0 else 0.0
+
+
+def build_jobs(selected) -> list[Job]:
+    movies = [strip for strip in selected if strip.type == "MOVIE"]
+    sounds = [strip for strip in selected if strip.type == "SOUND"]
+    paired: set[int] = set()
+    jobs: list[Job] = []
+
+    for movie in movies:
+        audio_strip = None
+        best_score = -1.0
+        for sound in sounds:
+            if id(sound) in paired:
+                continue
+            ratio = _overlap_ratio(movie, sound)
+            if ratio <= 0:
+                continue
+            same = _same_source(movie, sound)
+            if not same and ratio < 0.8:
+                continue
+            score = ratio + (2.0 if same else 0.0)
+            if score > best_score:
+                audio_strip = sound
+                best_score = score
+        if audio_strip is not None:
+            paired.add(id(audio_strip))
+        jobs.append(
+            Job(
+                strip=movie,
+                source=vse.source_path(movie),
+                name=movie.name,
+                audio_strip=audio_strip,
+            )
+        )
+
+    for sound in sounds:
+        if id(sound) in paired:
+            continue
+        jobs.append(Job(strip=sound, source=vse.source_path(sound), name=sound.name))
+    return jobs
 
 
 def _prefs(context=None):
@@ -206,6 +264,7 @@ class AnalyzeWorker(threading.Thread):
         self.cancel_event = threading.Event()
         self.proc = None
         self.log_lines = deque(maxlen=40)
+        self.total_runs = len(jobs)
 
     def cancel(self):
         self.cancel_event.set()
@@ -222,6 +281,24 @@ class AnalyzeWorker(threading.Thread):
     def _set_proc(self, proc):
         self.proc = proc
 
+    def _analyze(self, source, output, run_index, label):
+        self.out_queue.put(("status", f"Analyzing {label}"))
+
+        def progress(current, total, idx=run_index):
+            fraction = current / total if total else 0.0
+            self.out_queue.put(("progress", idx, fraction))
+
+        run_auto_editor(
+            self.exe,
+            source,
+            output,
+            self.options,
+            log=self._log,
+            progress=progress,
+            cancel_event=self.cancel_event,
+            on_proc=self._set_proc,
+        )
+
     def run(self):
         try:
             results = []
@@ -229,27 +306,12 @@ class AnalyzeWorker(threading.Thread):
                 if self.cancel_event.is_set():
                     break
                 v3_path = os.path.join(self.tempdir, f"job_{index}.v3")
-                self.out_queue.put(("status", f"Analyzing {job.name}"))
-
-                def progress(current, total, idx=index):
-                    fraction = current / total if total else 0.0
-                    self.out_queue.put(("progress", idx, fraction))
-
-                run_auto_editor(
-                    self.exe,
-                    job.source,
-                    v3_path,
-                    self.options,
-                    log=self._log,
-                    progress=progress,
-                    cancel_event=self.cancel_event,
-                    on_proc=self._set_proc,
-                )
+                self._analyze(job.source, v3_path, index, job.name)
                 if self.cancel_event.is_set():
                     break
                 timeline = v3.load(v3_path)
                 v3.validate_supported(timeline)
-                results.append((job.strip, timeline))
+                results.append((job.strip, timeline, job.audio_strip))
 
             if self.cancel_event.is_set():
                 self.out_queue.put(("cancelled",))
@@ -357,16 +419,6 @@ class AUTO_EDITOR_OT_remove_gaps(bpy.types.Operator):
             self.report({"ERROR"}, "Select one or more movie strips in the VSE.")
             return {"CANCELLED"}
 
-        movies = [strip for strip in selected if strip.type == "MOVIE"]
-        sounds = [strip for strip in selected if strip.type == "SOUND"]
-        if movies and sounds:
-            self.report(
-                {"ERROR"},
-                "Select either movie strips or sound strips, not both. "
-                "Movie strips already include their audio.",
-            )
-            return {"CANCELLED"}
-
         settings = context.scene.auto_editor_settings
         options = RunOptions(
             preset=settings.preset,
@@ -376,19 +428,17 @@ class AUTO_EDITOR_OT_remove_gaps(bpy.types.Operator):
             extra_args=settings.extra_args,
         )
 
-        jobs = []
-        for strip in selected:
-            try:
-                jobs.append(Job(strip, vse.source_path(strip), strip.name))
-            except vse.BuildError as exc:
-                self.report({"ERROR"}, str(exc))
-                return {"CANCELLED"}
+        try:
+            jobs = build_jobs(selected)
+        except vse.BuildError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
 
         self._tempdir = tempfile.mkdtemp(prefix="auto_editor_")
         self._queue = queue.Queue()
         self._worker = AnalyzeWorker(jobs, options, exe, self._tempdir, self._queue)
         self._settings = settings
-        self._job_count = len(jobs)
+        self._job_count = self._worker.total_runs
         self._cleaned = False
         self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
         context.window_manager.modal_handler_add(self)

@@ -34,18 +34,17 @@ class NewStrip:
 
 
 def top_strips(sequence_editor):
-    collection = getattr(sequence_editor, "strips", None) or getattr(
-        sequence_editor, "sequences", None
-    )
+    collection = getattr(sequence_editor, "strips", None)
+    if collection is None:
+        collection = getattr(sequence_editor, "sequences", None)
     return collection if collection is not None else ()
 
 
 def all_strips(sequence_editor):
-    return (
-        getattr(sequence_editor, "strips_all", None)
-        or getattr(sequence_editor, "sequences_all", None)
-        or top_strips(sequence_editor)
-    )
+    collection = getattr(sequence_editor, "strips_all", None)
+    if collection is None:
+        collection = getattr(sequence_editor, "sequences_all", None)
+    return collection if collection is not None else top_strips(sequence_editor)
 
 
 def selected_strips(context) -> list:
@@ -146,7 +145,18 @@ def _trim(strip, new_start: int, src_offset: int, duration: int) -> None:
         strip.frame_final_duration = duration
 
 
-def _plan_group(sequence_editor, group, tb_fps: float, fps: float, channels):
+def _unpack(job):
+    if len(job) == 2:
+        strip, timeline = job
+        return strip, timeline, None
+    if len(job) == 3:
+        strip, timeline, audio_strip = job
+        return strip, timeline, audio_strip
+    strip, timeline, _audio_timeline, audio_strip = job
+    return strip, timeline, audio_strip
+
+
+def _plan_group(sequence_editor, group, fps: float, channels):
     """Return (new_strips, originals, cursor_end)."""
     group = sorted(group, key=lambda job: job[0].frame_final_start)
     shared_cursor = len(group) > 1
@@ -155,11 +165,21 @@ def _plan_group(sequence_editor, group, tb_fps: float, fps: float, channels):
     planned: list[NewStrip] = []
     originals = []
 
-    for strip, timeline in group:
+    for strip, timeline, audio_strip in group:
         originals.append(strip)
+        if audio_strip is not None and audio_strip is not strip:
+            originals.append(audio_strip)
         if has_speed_control(sequence_editor, strip):
             raise BuildError(
                 f"{strip.name!r} has a Speed Control effect; flatten it first"
+            )
+        if (
+            audio_strip is not None
+            and audio_strip is not strip
+            and has_speed_control(sequence_editor, audio_strip)
+        ):
+            raise BuildError(
+                f"{audio_strip.name!r} has a Speed Control effect; flatten it first"
             )
 
         if not shared_cursor:
@@ -169,49 +189,59 @@ def _plan_group(sequence_editor, group, tb_fps: float, fps: float, channels):
             video_clips = v3.kept(v3.single_video_layer(timeline))
             if not video_clips:
                 continue
-            audio_clips = v3.kept(v3.single_audio_layer(timeline))
-            source_total = int(round(strip.frame_duration))
-            if any(clip.stream for clip in audio_clips):
-                raise BuildError("Multi-stream audio is not supported yet")
-            source = source_path(strip)
+            embedded_audio = bool(v3.kept(v3.single_audio_layer(timeline)))
+            audio_owner = (
+                audio_strip
+                if audio_strip is not None
+                else (strip if embedded_audio else None)
+            )
+            video_total = int(round(strip.frame_duration))
+            video_source = source_path(strip)
+            origin_start = int(round(strip.frame_final_start))
+            origin_offset = int(round(strip.frame_offset_start))
+
+            if audio_owner is not None:
+                audio_source = source_path(audio_owner)
+                audio_lo = int(round(audio_owner.frame_offset_start))
+                audio_hi = audio_lo + int(round(audio_owner.frame_final_duration))
+                audio_total = int(round(audio_owner.frame_duration))
+                audio_owner_start = int(round(audio_owner.frame_final_start))
 
             for index, clip in enumerate(video_clips):
-                window = _window(clip, strip, source_total, tb_fps, fps)
+                window = _window(clip, strip, video_total, timeline.fps, fps)
                 if window is None:
                     continue
                 planned.append(
                     NewStrip(
                         kind="MOVIE",
-                        source=source,
+                        source=video_source,
                         channel=movie_channel,
                         new_start=cursor,
                         src_offset=window.src_offset,
                         duration=window.duration,
-                        offset_end=source_total - window.src_offset - window.duration,
+                        offset_end=video_total - window.src_offset - window.duration,
                         name=f"{strip.name} cut {index + 1}",
                     )
                 )
-                if index < len(audio_clips):
-                    audio_window = _window(
-                        audio_clips[index],
-                        strip,
-                        source_total,
-                        tb_fps,
-                        fps,
-                        max_duration=window.duration,
-                    )
-                    if audio_window is not None:
+
+                if audio_owner is not None:
+                    source_start = origin_start + (window.src_offset - origin_offset)
+                    if audio_owner is strip:
+                        audio_offset = window.src_offset
+                    else:
+                        audio_offset = audio_lo + (source_start - audio_owner_start)
+                    start = max(audio_offset, audio_lo, 0)
+                    end = min(audio_offset + window.duration, audio_hi, audio_total)
+                    if end > start:
                         planned.append(
                             NewStrip(
                                 kind="SOUND",
-                                source=source,
+                                source=audio_source,
                                 channel=sound_channel,
-                                new_start=cursor,
-                                src_offset=audio_window.src_offset,
-                                duration=audio_window.duration,
-                                offset_end=source_total
-                                - audio_window.src_offset
-                                - audio_window.duration,
+                                new_start=cursor + (start - audio_offset),
+                                src_offset=start,
+                                duration=end - start,
+                                offset_end=audio_total - start - (end - start),
                                 name=f"{strip.name} audio {index + 1}",
                             )
                         )
@@ -226,7 +256,7 @@ def _plan_group(sequence_editor, group, tb_fps: float, fps: float, channels):
             source_total = int(round(strip.frame_duration))
             source = source_path(strip)
             for index, clip in enumerate(audio_clips):
-                window = _window(clip, strip, source_total, tb_fps, fps)
+                window = _window(clip, strip, source_total, timeline.fps, fps)
                 if window is None:
                     continue
                 planned.append(
@@ -249,10 +279,11 @@ def _plan_group(sequence_editor, group, tb_fps: float, fps: float, channels):
 
 
 def build_cuts(context, jobs, settings) -> str:
-    """jobs is [(original_strip, v3.Timeline), ...]."""
+    """Jobs are (strip, timeline[, audio_strip])."""
     if not jobs:
-        raise BuildError("Select at least one movie strip")
+        raise BuildError("Select at least one movie or sound strip")
 
+    jobs = [_unpack(job) for job in jobs]
     scene = context.scene
     sequence_editor = scene.sequence_editor
     if sequence_editor is None:
@@ -262,13 +293,22 @@ def build_cuts(context, jobs, settings) -> str:
     old_fps = scene.render.fps
     old_fps_base = scene.render.fps_base
 
-    timebase = jobs[0][1].fps
-    for _, timeline in jobs:
-        if abs(timeline.fps - timebase) > 1e-4:
-            raise BuildError(
-                "Selected sources have different frame rates; process them separately"
-            )
+    base_timeline = None
+    movie_fps = None
+    for strip, timeline, _ in jobs:
         v3.validate_supported(timeline)
+        if strip.type == "MOVIE":
+            if movie_fps is None:
+                movie_fps = timeline.fps
+                base_timeline = timeline
+            elif abs(timeline.fps - movie_fps) > 1e-4:
+                raise BuildError(
+                    "Selected movie sources have different frame rates; "
+                    "process them separately"
+                )
+    if base_timeline is None:
+        base_timeline = jobs[0][1]
+    timebase = base_timeline.fps
 
     fps_changed = abs(fps_before - timebase) > 1e-4
     if fps_changed and not settings.match_fps:
@@ -281,25 +321,26 @@ def build_cuts(context, jobs, settings) -> str:
     created = []
     try:
         if fps_changed:
-            set_scene_fps(scene, jobs[0][1].timebase_num, jobs[0][1].timebase_den)
+            set_scene_fps(scene, base_timeline.timebase_num, base_timeline.timebase_den)
         fps = scene_fps(scene)
 
-        selected = [strip for strip, _ in jobs]
+        selected = [strip for strip, _, _ in jobs]
         ripple = (
             settings.ripple
             and len(jobs) > 1
             and len({strip.channel for strip in selected}) == 1
         )
         groups = [jobs] if ripple else [[job] for job in jobs]
-        groups.sort(key=lambda group: min(strip.channel for strip, _ in group))
+        groups.sort(key=lambda group: min(strip.channel for strip, _, _ in group))
 
         next_channel = find_free_channel(sequence_editor)
         group_channels = []
         for group in groups:
-            has_movie = any(strip.type == "MOVIE" for strip, _ in group)
-            has_audio = any(strip.type == "SOUND" for strip, _ in group) or any(
-                v3.kept(v3.single_audio_layer(timeline))
-                for strip, timeline in group
+            has_movie = any(strip.type == "MOVIE" for strip, _, _ in group)
+            has_audio = any(strip.type == "SOUND" for strip, _, _ in group) or any(
+                audio_strip is not None
+                or bool(v3.kept(v3.single_audio_layer(timeline)))
+                for strip, timeline, audio_strip in group
                 if strip.type == "MOVIE"
             )
             movie_channel = next_channel if has_movie else None
@@ -315,15 +356,19 @@ def build_cuts(context, jobs, settings) -> str:
 
         plan = []
         originals = []
+        seen_originals = set()
         for group, channels in zip(groups, group_channels):
             movie_channel, sound_channel = channels
             if movie_channel is None and sound_channel is None:
                 continue
             group_plan, group_originals, _ = _plan_group(
-                sequence_editor, group, timebase, fps, channels
+                sequence_editor, group, fps, channels
             )
             plan.extend(group_plan)
-            originals.extend(group_originals)
+            for strip in group_originals:
+                if id(strip) not in seen_originals:
+                    seen_originals.add(id(strip))
+                    originals.append(strip)
 
         if not plan:
             raise BuildError("auto-editor kept nothing for the selected strip(s)")

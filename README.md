@@ -1,9 +1,10 @@
 # Auto-Editor Blender
 
-A small Blender VSE add-on that removes silence gaps from selected movie strips.
+A small Blender VSE add-on that removes silence gaps from selected movie and
+sound strips.
 
-Select one or more movie strips in the Video Sequencer, click **Remove Gaps**, and
-the add-on:
+Select strips in the Video Sequencer, click **Cut Silence** (or **Cut
+Motionless**), and the add-on:
 
 1. runs the official [`auto-editor`](https://github.com/WyattBlue/auto-editor) binary
    on each source file,
@@ -17,7 +18,8 @@ The edit is a normal Blender undo step. `Ctrl+Z` restores the original strips.
 ## Requirements
 
 - Blender **4.2+** (tested with 5.0.1).
-- The official **auto-editor** binary, version **31.x** or newer.
+- The official **auto-editor** binary, version **30.1.0** or newer
+  (tested with 30.1.0 and 31.7.2).
   - Download: <https://github.com/WyattBlue/auto-editor/releases>
   - Put it on `PATH` as `auto-editor`, or set its path in
     **Edit > Preferences > Add-ons > Auto-Editor Blender**.
@@ -40,14 +42,17 @@ a Blender extension/add-on directory.
 
 ## Use
 
-1. In the Video Sequencer, select one or more **movie** strips.
+1. In the Video Sequencer, select one or more **movie** strips. You may also
+   select their overlapping/linked sound strips; the pair is handled as one job.
 2. Open the sidebar and choose the **Auto-Editor** tab.
 3. Pick **Cut silence** or **Cut motionless**, adjust the threshold if needed.
-4. Click **Remove Gaps**.
+4. Click **Cut Silence** / **Cut Motionless**.
 
-Select either movie strips or sound strips for one run, not both. Movie strips
-already carry their audio; selecting both would duplicate the audio. The
-**Advanced** subpanel has extra CLI arguments and a command preview.
+If a selected sound strip overlaps a selected movie strip (Blender's linked
+`*.001` sound strip is the common case), the pair is joined: video comes from the
+movie, audio from the sound. Sound strips with no overlapping movie are processed
+on their own. The **Advanced** subpanel has extra CLI arguments and a command
+preview.
 
 If several selected strips are on the same channel and **Ripple selected strips**
 is enabled, their kept clips are placed back to back as one continuous sequence.
@@ -64,7 +69,7 @@ keep them on their channels, muted.
 - The add-on matches the scene FPS to the source FPS by default. If two selected
   sources have different frame rates, process them separately.
 - Movie strips that already have a Speed Control effect are not supported.
-- Separate sound strips are processed only when selected without movie strips.
+- Movie/sound pairing is heuristic: same source file, or at least 80% overlap.
 
 ## Development
 
@@ -81,7 +86,15 @@ AUTO_EDITOR_TEST_VIDEO=/path/to/video.mp4 \
   blender -b --factory-startup --python tests/blender_smoke.py
 ```
 
-It is skipped when `AUTO_EDITOR_TEST_VIDEO` is not set.
+The pairing test covers movie+sound pairing, a separate audio file, and
+sound-only processing:
+
+```bash
+AUTO_EDITOR_TEST_VIDEO=/path/to/video.mp4 \
+  blender -b --factory-startup --python tests/blender_pair.py
+```
+
+Both tests are skipped when `AUTO_EDITOR_TEST_VIDEO` is not set.
 
 ## License
 

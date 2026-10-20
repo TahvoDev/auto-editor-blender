@@ -10,7 +10,7 @@ ADDON_ID = __package__
 bl_info = {
     "name": "Auto-Editor Blender",
     "author": "Jenny",
-    "version": (0, 1, 1),
+    "version": (0, 1, 2),
     "blender": (4, 2, 0),
     "location": "Sequencer > Sidebar > Auto-Editor",
     "description": "Remove silence gaps from VSE strips without touching source files",
@@ -133,19 +133,21 @@ class AUTO_EDITOR_PT_main(bpy.types.Panel):
                 icon="PREFERENCES",
             ).module = ADDON_ID
 
+        settings = context.scene.auto_editor_settings
+
         layout.label(text=f"Selected: {len(movies)} movie, {len(sounds)} sound")
         if not selected:
             layout.label(text="Select movie strip(s) in the VSE", icon="INFO")
         elif movies and sounds:
-            layout.label(text="Select movie or sound strips, not both", icon="ERROR")
+            layout.label(text="Sounds overlapping movies are paired", icon="LINKED")
 
         row = layout.row()
         row.scale_y = 1.5
-        row.enabled = bool(exe and selected and not (movies and sounds))
-        row.operator("auto_editor.remove_gaps", text="Remove Gaps", icon="SEQUENCE")
+        row.enabled = bool(exe and selected)
+        action = "Cut Silence" if settings.preset == "SILENCE" else "Cut Motionless"
+        row.operator("auto_editor.remove_gaps", text=action, icon="PLAY")
 
         layout.separator()
-        settings = context.scene.auto_editor_settings
         layout.prop(settings, "preset")
         if settings.preset == "SILENCE":
             layout.prop(settings, "audio_threshold")
